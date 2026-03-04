@@ -934,6 +934,29 @@ from datetime import datetime
 obj=json.load(open(sys.argv[1],'r',encoding='utf-8'))
 
 states=obj.get('actionStates',{}) or {}
+completed=obj.get('resumeCompletedActions',[]) or []
+pending_actions=obj.get('pendingActions',[]) or []
+
+# action 元信息：优先从 completed/pending 提取 type 与简述
+meta={}
+for a in completed + pending_actions:
+    if not isinstance(a,dict):
+        continue
+    aid=str(a.get('actionId',''))
+    if not aid:
+        continue
+    t=a.get('type','unknown')
+    brief=''
+    if t=='notify':
+        brief=(a.get('text') or a.get('params',{}).get('text',''))[:20]
+    elif t=='command':
+        brief=(a.get('command') or a.get('params',{}).get('command',''))[:20]
+    elif t=='script':
+        brief=(a.get('path') or a.get('params',{}).get('path',''))[:20]
+    elif t=='query_time':
+        brief=(a.get('timezone') or a.get('params',{}).get('timezone','Asia/Shanghai'))
+    meta[aid]={'type':t,'brief':brief}
+
 rows=[]
 ok=fail=running=pending=skipped=0
 for aid,v in sorted(states.items()):
@@ -943,9 +966,16 @@ for aid,v in sorted(states.items()):
     elif st=='running': running+=1
     elif st=='pending': pending+=1
     elif st=='skipped': skipped+=1
+
+    m=meta.get(aid,{})
+    t=m.get('type','unknown')
+    brief=m.get('brief','')
     err=(v.get('lastError') or '').strip()
     attempts=v.get('attempts',0)
-    item=f"{aid}:{st}"
+
+    item=f"{aid}({t})={st}"
+    if brief:
+        item += f":{brief}"
     if st=='failed' and attempts:
         item += f"(重试{attempts}次)"
     if st=='failed' and err:
@@ -953,7 +983,14 @@ for aid,v in sorted(states.items()):
     rows.append(item)
 
 total=len(states)
-remaining=len(obj.get('pendingActions',[]) or [])
+remaining=len(pending_actions)
+
+# 清理结果细化
+cleaned_total=len(completed)
+cleaned_success=sum(1 for aid,v in states.items() if v.get('status')=='success')
+cleaned_failed=sum(1 for aid,v in states.items() if v.get('status')=='failed')
+cleaned_skipped=sum(1 for aid,v in states.items() if v.get('status')=='skipped')
+alerts=cleaned_failed
 
 # 时间优先用已记录值，其次当前时间
 time_human=obj.get('currentTimeHuman')
@@ -968,7 +1005,12 @@ list_text='；'.join(shown) if shown else '无'
 if more>0:
     list_text += f'；其余{more}项省略'
 
-cleanup=f"清理结果：剩余待处理 {remaining} 项"
+cleanup=(
+    f"任务清理：已清理{cleaned_total}项"
+    f"（成功{cleaned_success}/失败{cleaned_failed}/跳过{cleaned_skipped}）"
+    f"；保留{remaining}项；告警{alerts}项"
+)
+
 msg=(
     f"【重启成功后通知】Gateway 已恢复（{time_human}）。"
     f"任务队列：总{total}｜完成{ok}｜失败{fail}｜跳过{skipped}｜执行中{running}｜待处理{pending}。"

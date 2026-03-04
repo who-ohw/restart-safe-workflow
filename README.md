@@ -86,7 +86,7 @@ skills/restart-safe-workflow/scripts/restart-acceptance.sh --with-restart \
 
 - 默认：`NOTIFY_MODE=compact`（仅 2 条）
   1) `【重启通知】`
-  2) `【重启成功后通知】`（合并队列统计 + 任务清单 + 清理结果）
+  2) `【重启成功后通知】`（合并队列统计 + 任务清单 + 清理结果：已清理/保留/告警）
 - 调试：`NOTIFY_MODE=verbose`（保留过程型多条通知）
 
 示例：
