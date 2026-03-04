@@ -11,6 +11,7 @@ REPORT_FILE=""
 NOTIFY_CHANNEL="${NOTIFY_CHANNEL:-}"
 NOTIFY_TARGET="${NOTIFY_TARGET:-}"
 NOTIFY_ACCOUNT="${NOTIFY_ACCOUNT:-}"
+NOTIFY_MODE="${NOTIFY_MODE:-compact}"
 INTERNAL_RUN="false"
 DETACH_ON_RESTART="true"
 
@@ -26,6 +27,7 @@ while [ "$#" -gt 0 ]; do
     --notify-channel) NOTIFY_CHANNEL="${2:-}"; shift 2 ;;
     --notify-target) NOTIFY_TARGET="${2:-}"; shift 2 ;;
     --notify-account) NOTIFY_ACCOUNT="${2:-}"; shift 2 ;;
+    --notify-mode) NOTIFY_MODE="${2:-compact}"; shift 2 ;;
     --internal-run) INTERNAL_RUN="true"; shift ;;
     --no-detach) DETACH_ON_RESTART="false"; shift ;;
     -h|--help)
@@ -34,6 +36,7 @@ while [ "$#" -gt 0 ]; do
   skills/restart-safe-workflow/scripts/restart-acceptance.sh [--with-restart]
       [--task-prefix <prefix>] [--report-file <path>]
       [--notify-channel <c> --notify-target <t> [--notify-account <a>]]
+      [--notify-mode compact|verbose]
       [--internal-run] [--no-detach]
 EOF
       exit 0 ;;
@@ -48,7 +51,7 @@ mkdir -p "$(dirname "$REPORT_FILE")" "$STATE_DIR"
 # 自守护模式：当启用真实重启时，默认先自我detached，避免调用会话在重启中断
 if [ "$WITH_RESTART" = "true" ] && [ "$DETACH_ON_RESTART" = "true" ] && [ "$INTERNAL_RUN" != "true" ]; then
   SELF_LOG="${STATE_DIR}/acceptance-${TASK_PREFIX}.runner.log"
-  nohup bash -lc "cd '$(pwd)' && '$0' --with-restart --task-prefix '$TASK_PREFIX' --report-file '$REPORT_FILE' --internal-run ${NOTIFY_CHANNEL:+--notify-channel '$NOTIFY_CHANNEL'} ${NOTIFY_TARGET:+--notify-target '$NOTIFY_TARGET'} ${NOTIFY_ACCOUNT:+--notify-account '$NOTIFY_ACCOUNT'}" >"$SELF_LOG" 2>&1 < /dev/null &
+  nohup bash -lc "cd '$(pwd)' && '$0' --with-restart --task-prefix '$TASK_PREFIX' --report-file '$REPORT_FILE' --internal-run --notify-mode '$NOTIFY_MODE' ${NOTIFY_CHANNEL:+--notify-channel '$NOTIFY_CHANNEL'} ${NOTIFY_TARGET:+--notify-target '$NOTIFY_TARGET'} ${NOTIFY_ACCOUNT:+--notify-account '$NOTIFY_ACCOUNT'}" >"$SELF_LOG" 2>&1 < /dev/null &
   echo "[DETACHED] acceptance runner started: pid=$! log=$SELF_LOG report=$REPORT_FILE"
   exit 0
 fi
@@ -103,6 +106,7 @@ fi
 log "=== OpenClaw 重启流程一键验收开始 ==="
 log "task_prefix=${TASK_PREFIX}"
 log "with_restart=${WITH_RESTART}"
+log "notify_mode=${NOTIFY_MODE}"
 log "report=${REPORT_FILE}"
 
 # TC0: Phase1 计划编译/校验
@@ -204,7 +208,7 @@ fi
 
 if [ "$WITH_RESTART" = "true" ]; then
   rm -f "$STATE_RESTART" "$RUNNER_LOG"
-  if ACTION_ALLOWLIST_FILE="$ALLOWLIST_FILE" "$SAFE_SCRIPT" run --task-id "$TASK_RESTART" --next "notify:重启后自动续跑动作" --criteria "真实重启+续跑完成" "${NOTIFY_ARGS[@]}" >/tmp/restart-accept-real.out 2>&1; then
+  if NOTIFY_MODE="$NOTIFY_MODE" ACTION_ALLOWLIST_FILE="$ALLOWLIST_FILE" "$SAFE_SCRIPT" run --task-id "$TASK_RESTART" --next "notify:重启后自动续跑动作" --criteria "真实重启+续跑完成" "${NOTIFY_ARGS[@]}" >/tmp/restart-accept-real.out 2>&1; then
     pass "TC7 run 启动成功（detached）"
   else
     fail "TC7 run 启动失败"
@@ -224,7 +228,22 @@ if [ "$WITH_RESTART" = "true" ]; then
     if [ "$(json_get "$STATE_RESTART" healthOk)" = "true" ] && [ "$(json_get "$STATE_RESTART" resumeEventSent)" = "true" ] && [ "$(json_get "$STATE_RESTART" resumeStatus)" = "success" ]; then
       if [ -n "$NOTIFY_CHANNEL" ] && [ -n "$NOTIFY_TARGET" ]; then
         if [ "$(json_get "$STATE_RESTART" notifyPreSent)" = "true" ] && [ "$(json_get "$STATE_RESTART" notifyPostSent)" = "true" ]; then
-          pass "TC8 真实重启 + 通知 + 续跑全通过"
+          if [ "$NOTIFY_MODE" = "compact" ]; then
+            vis_count="$(python3 - <<'PY' "$STATE_RESTART"
+import json,sys
+obj=json.load(open(sys.argv[1],'r',encoding='utf-8'))
+notes=[t.get('note','') for t in obj.get('timeline',[])]
+print(sum(1 for n in notes if n.startswith('visible-notify:')))
+PY
+)"
+            if [ "$vis_count" = "2" ]; then
+              pass "TC8 真实重启 + 通知(2条制) + 续跑全通过"
+            else
+              fail "TC8 通知条数不符合compact预期(实际=${vis_count}, 预期=2)"
+            fi
+          else
+            pass "TC8 真实重启 + 通知 + 续跑全通过"
+          fi
         else
           fail "TC8 真实重启通过，但通知字段不完整"
         fi

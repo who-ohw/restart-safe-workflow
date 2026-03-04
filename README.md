@@ -115,6 +115,8 @@ references/{restart-safe-sop.md,phase0-requirements-v1.md,phase4-rollout-checkli
 - acceptance 覆盖升级：新增 plan/validate/report-verbose 断言
 - 修复 TC10：`reconcile` 在 no-restart 失败链路可触发 `retry_exceeded`
 - 真实重启验收默认自守护 detached，避免会话重启中断报告
+- 通知策略升级：默认 `NOTIFY_MODE=compact`（2条制）
+- Phase C 完成：后置通知新增“任务清理：已清理/保留/告警”细化
 
 ### v1.0.1 (2026-03-04)
 - Phase 1/2 完成：TaskPlan v1、`notify-time`、deps/retry/idempotency/onFailure
