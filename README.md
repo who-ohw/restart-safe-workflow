@@ -1,153 +1,65 @@
 # restart-safe-workflow
 
-Safe OpenClaw gateway restart workflow（Sprint 1-4 已落地版）：
-- 重启安全事务（doctor → checkpoint → restart → health → resume）
-- detached runner 断链解耦
-- 前后可见回执（可选）
-- 任务续跑（pendingActions）
-- reconcile 补偿 + 重试/升级
-- report / diagnose 可观测能力
+Safe restart workflow for OpenClaw gateway: **doctor 预检 → checkpoint 落盘 → restart → health → resume → 可见回执 → 任务续跑**。
 
-## 当前实现范围（真实已实现）
+## 适用场景
+- 需要执行 `openclaw gateway restart`
+- 配置变更后安全重启并自动续跑
+- 希望重启前后有用户可见通知
+- 需要失败补偿、诊断与升级标记
 
-### Sprint 1
-- 状态机基础与状态落盘
-- doctor 阻断、checkpoint 落盘、resume 补发
+## 核心能力
+- `run / continue / resume-run / reconcile`
+- TaskPlan：`plan / validate`（v1）
+- 语义动作：`notify-time[:TZ]`
+- Action 状态机：deps/retry/idempotency/onFailure
+- 可观测：`report --verbose` / `diagnose`
+- 验收：`restart-acceptance.sh`（支持 `--with-restart`）
 
-### Sprint 2
-- detached runner 解耦会话与重启链路
-- 解决“重启导致后半流程失联”
-
-### Sprint 3
-- 通知契约修复（CLI 参数契约）
-- done gate 强约束：通知/健康/resume 不满足不允许 done
-
-### Sprint 3.5
-- 任务级续跑：`pendingActions` / `resumeCompletedActions` / `resumeCursor`
-- 重启前任务清单、重启后待处理清单、重启后执行结果清单
-
-### Sprint 4
-- 回归验收脚本扩展（TC1~TC10）
-- `report` / `diagnose` 子命令
-- reconcile 重试与升级（`RECONCILE_MAX_RETRIES`、`RECONCILE_BACKOFF_SEC`）
-- 白名单外置文件：`config-action-allowlist.txt`
-- SKILL/SOP 文档同步更新
-
----
-
-## 目录
-
-```text
-skills/restart-safe-workflow/
-├── SKILL.md
-├── README.md
-├── config-action-allowlist.txt
-├── scripts/
-│   ├── restart-safe.sh
-│   └── restart-acceptance.sh
-└── references/
-    └── restart-safe-sop.md
-```
-
----
-
-## 常用命令
-
-### 1) 执行重启任务（默认 detached）
+## 快速开始
 
 ```bash
+# 1) 常规安全重启
 skills/restart-safe-workflow/scripts/restart-safe.sh run \
   --task-id task-$(date +%Y%m%d-%H%M%S) \
-  --next "notify:重启后继续任务" \
-  --criteria "重启成功且续跑完成"
-```
-
-### 2) 带可见回执
-
-```bash
-skills/restart-safe-workflow/scripts/restart-safe.sh run \
-  --task-id task-$(date +%Y%m%d-%H%M%S) \
-  --next "cmd:echo post-restart" \
-  --criteria "前后回执+续跑成功" \
+  --next "notify:重启完成;notify-time" \
   --notify-channel feishu \
   --notify-target user:<open_id> \
   --notify-account master
-```
 
-### 3) 仅续跑动作（不重启）
+# 2) 计划预览 + 校验
+skills/restart-safe-workflow/scripts/restart-safe.sh plan --task-id demo --next "notify:ok;notify-time"
+skills/restart-safe-workflow/scripts/restart-safe.sh validate --tasks-file skills/restart-safe-workflow/examples/plan-valid.json
 
-```bash
-skills/restart-safe-workflow/scripts/restart-safe.sh resume-run --task-id <task-id>
-```
-
-### 4) 补偿
-
-```bash
-# 单任务
-skills/restart-safe-workflow/scripts/restart-safe.sh reconcile --task-id <task-id>
-
-# 批量
-skills/restart-safe-workflow/scripts/restart-safe.sh reconcile
-```
-
-### 5) 摘要与诊断
-
-```bash
-skills/restart-safe-workflow/scripts/restart-safe.sh report --task-id <task-id>
-skills/restart-safe-workflow/scripts/restart-safe.sh diagnose --task-id <task-id>
-```
-
-### 6) 一键验收
-
-```bash
-# 默认不真实重启
+# 3) 一键验收（默认不真实重启）
 skills/restart-safe-workflow/scripts/restart-acceptance.sh
 
-# 真实重启链路
+# 4) 真实重启验收（默认自守护 detached）
 skills/restart-safe-workflow/scripts/restart-acceptance.sh --with-restart \
   --notify-channel feishu --notify-target user:<open_id> --notify-account master
 ```
 
----
+## 目录（建议发布保留）
+```text
+SKILL.md
+README.md
+config-action-allowlist.txt
+schemas/taskspec-v1.schema.json
+examples/{plan-valid.json,plan-invalid.json}
+scripts/{restart-safe.sh,restart-acceptance.sh}
+references/{restart-safe-sop.md,phase0-requirements-v1.md,phase4-rollout-checklist.md}
+```
 
-## `--next` 支持
+## Changelog（最近两次迭代）
 
-- `notify:<text>`
-- `cmd:<command>`
-- `script:<path>`
-- `json:[{...}]`
+### v1.0.2 (2026-03-04)
+- Phase 3/4 完成：`report --verbose`、action 级 `diagnose`
+- acceptance 覆盖升级：新增 plan/validate/report-verbose 断言
+- 修复 TC10：`reconcile` 在 no-restart 失败链路可触发 `retry_exceeded`
+- 真实重启验收默认自守护 detached，避免会话重启中断报告
 
----
+### v1.0.1 (2026-03-04)
+- Phase 1/2 完成：TaskPlan v1、`notify-time`、deps/retry/idempotency/onFailure
+- `run --tasks-file` 支持任务文件入队
 
-## 关键状态字段
-
-- `phase`
-- `healthOk`
-- `resumeEventSent`
-- `notifyPreSent / notifyPostSent`
-- `resumeStatus`（idle/running/success/failed）
-- `pendingActions / resumeCompletedActions`
-- `resumeCursor`
-- `escalationRequired / escalationReason`
-
----
-
-## 环境变量
-
-- `STATE_DIR`（默认 `./state/restart`）
-- `GATEWAY_RESTART_CMD`（默认 `openclaw gateway restart`）
-- `HEALTH_TIMEOUT_SEC`（默认 `30`）
-- `RECONCILE_MAX_RETRIES`（默认 `3`）
-- `RECONCILE_BACKOFF_SEC`（默认 `5`）
-- `ACTION_ALLOWLIST_FILE`（命令白名单文件）
-
----
-
-## 判定标准（done gate）
-
-仅当以下条件满足才写 `phase=done`：
-1. `healthOk=true`
-2. `resumeEventSent=true`
-3. `notifyPreSent=true`（启用通知时）
-4. `notifyPostSent=true`（启用通知时）
-5. `resumeStatus=success`
+> 详细变更可见 `CHANGELOG.md`。

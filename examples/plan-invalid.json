@@ -1,0 +1,10 @@
+{
+  "taskPlanVersion": "v0",
+  "taskId": "demo-plan-bad",
+  "actions": [
+    {
+      "actionId": "a1",
+      "type": "unknown_action"
+    }
+  ]
+}

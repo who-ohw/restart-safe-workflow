@@ -11,6 +11,8 @@ REPORT_FILE=""
 NOTIFY_CHANNEL="${NOTIFY_CHANNEL:-}"
 NOTIFY_TARGET="${NOTIFY_TARGET:-}"
 NOTIFY_ACCOUNT="${NOTIFY_ACCOUNT:-}"
+INTERNAL_RUN="false"
+DETACH_ON_RESTART="true"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SAFE_SCRIPT="${SCRIPT_DIR}/restart-safe.sh"
@@ -24,12 +26,15 @@ while [ "$#" -gt 0 ]; do
     --notify-channel) NOTIFY_CHANNEL="${2:-}"; shift 2 ;;
     --notify-target) NOTIFY_TARGET="${2:-}"; shift 2 ;;
     --notify-account) NOTIFY_ACCOUNT="${2:-}"; shift 2 ;;
+    --internal-run) INTERNAL_RUN="true"; shift ;;
+    --no-detach) DETACH_ON_RESTART="false"; shift ;;
     -h|--help)
       cat <<'EOF'
 用法：
   skills/restart-safe-workflow/scripts/restart-acceptance.sh [--with-restart]
       [--task-prefix <prefix>] [--report-file <path>]
       [--notify-channel <c> --notify-target <t> [--notify-account <a>]]
+      [--internal-run] [--no-detach]
 EOF
       exit 0 ;;
     *) echo "未知参数: $1" >&2; exit 2 ;;
@@ -39,6 +44,14 @@ done
 [ -n "$REPORT_FILE" ] || REPORT_FILE="./state/restart/acceptance-${TASK_PREFIX}.log"
 mkdir -p "$(dirname "$REPORT_FILE")" "$STATE_DIR"
 : > "$REPORT_FILE"
+
+# 自守护模式：当启用真实重启时，默认先自我detached，避免调用会话在重启中断
+if [ "$WITH_RESTART" = "true" ] && [ "$DETACH_ON_RESTART" = "true" ] && [ "$INTERNAL_RUN" != "true" ]; then
+  SELF_LOG="${STATE_DIR}/acceptance-${TASK_PREFIX}.runner.log"
+  nohup bash -lc "cd '$(pwd)' && '$0' --with-restart --task-prefix '$TASK_PREFIX' --report-file '$REPORT_FILE' --internal-run ${NOTIFY_CHANNEL:+--notify-channel '$NOTIFY_CHANNEL'} ${NOTIFY_TARGET:+--notify-target '$NOTIFY_TARGET'} ${NOTIFY_ACCOUNT:+--notify-account '$NOTIFY_ACCOUNT'}" >"$SELF_LOG" 2>&1 < /dev/null &
+  echo "[DETACHED] acceptance runner started: pid=$! log=$SELF_LOG report=$REPORT_FILE"
+  exit 0
+fi
 
 PASS_CNT=0
 FAIL_CNT=0
@@ -91,6 +104,29 @@ log "=== OpenClaw 重启流程一键验收开始 ==="
 log "task_prefix=${TASK_PREFIX}"
 log "with_restart=${WITH_RESTART}"
 log "report=${REPORT_FILE}"
+
+# TC0: Phase1 计划编译/校验
+if "$SAFE_SCRIPT" plan --task-id "${TASK_PREFIX}-plan" --next "notify:验收;notify-time" >/tmp/restart-accept-plan.out 2>&1; then
+  if grep -q '"taskPlanVersion": "v1"' /tmp/restart-accept-plan.out; then
+    pass "TC0 plan 输出 TaskPlan(v1)"
+  else
+    fail "TC0 plan 输出缺少 taskPlanVersion"
+  fi
+else
+  fail "TC0 plan 执行失败"
+fi
+
+if "$SAFE_SCRIPT" validate --tasks-file "${SCRIPT_DIR}/../examples/plan-valid.json" >/tmp/restart-accept-validate-ok.out 2>&1; then
+  pass "TC0.1 validate(valid) 通过"
+else
+  fail "TC0.1 validate(valid) 失败"
+fi
+
+if "$SAFE_SCRIPT" validate --tasks-file "${SCRIPT_DIR}/../examples/plan-invalid.json" >/tmp/restart-accept-validate-bad.out 2>&1; then
+  fail "TC0.2 validate(invalid) 应失败但成功"
+else
+  pass "TC0.2 validate(invalid) 正确失败"
+fi
 
 if openclaw doctor --non-interactive >/tmp/restart-accept-doctor.out 2>&1; then
   pass "TC1 doctor --non-interactive 可执行"
@@ -148,6 +184,16 @@ if ACTION_ALLOWLIST_FILE="$ALLOWLIST_FILE" "$SAFE_SCRIPT" report --task-id "$TAS
   grep -q '"pendingCount"' /tmp/restart-accept-report.out && pass "TC5 report 输出摘要成功" || fail "TC5 report 输出缺少关键字段"
 else
   fail "TC5 report 执行失败"
+fi
+
+if ACTION_ALLOWLIST_FILE="$ALLOWLIST_FILE" "$SAFE_SCRIPT" report --task-id "$TASK_MAIN" --verbose >/tmp/restart-accept-report-verbose.out 2>&1; then
+  if grep -q '"actionDetails"' /tmp/restart-accept-report-verbose.out && grep -q '"actionStats"' /tmp/restart-accept-report-verbose.out; then
+    pass "TC5.1 report --verbose 输出动作级明细"
+  else
+    fail "TC5.1 report --verbose 缺少 actionDetails/actionStats"
+  fi
+else
+  fail "TC5.1 report --verbose 执行失败"
 fi
 
 if ACTION_ALLOWLIST_FILE="$ALLOWLIST_FILE" "$SAFE_SCRIPT" diagnose --task-id "$TASK_MAIN" >/tmp/restart-accept-diagnose.out 2>&1; then

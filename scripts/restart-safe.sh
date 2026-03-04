@@ -13,6 +13,7 @@ ACTION_ALLOWLIST_FILE="${ACTION_ALLOWLIST_FILE:-}"
 NOTIFY_CHANNEL="${NOTIFY_CHANNEL:-}"
 NOTIFY_TARGET="${NOTIFY_TARGET:-}"
 NOTIFY_ACCOUNT="${NOTIFY_ACCOUNT:-}"
+REPORT_VERBOSE="${REPORT_VERBOSE:-false}"
 
 mkdir -p "$STATE_DIR"
 
@@ -81,6 +82,9 @@ obj.setdefault("pendingActions", [])
 obj.setdefault("resumeCompletedActions", [])
 obj.setdefault("escalationRequired", False)
 obj.setdefault("escalationReason", "")
+obj.setdefault("taskPlanVersion", "v1")
+obj.setdefault("actionStates", {})
+obj.setdefault("idempotencyLedger", {})
 with open(file, 'w', encoding='utf-8') as f:
     json.dump(obj, f, ensure_ascii=False, indent=2)
 PY
@@ -248,6 +252,42 @@ print('\n'.join(lines))
 PY
 }
 
+action_state_stats() {
+  local file="$1"
+  python3 - "$file" <<'PY'
+import json,sys
+obj=json.load(open(sys.argv[1],'r',encoding='utf-8'))
+states=obj.get('actionStates',{}) or {}
+stats={'pending':0,'running':0,'success':0,'failed':0,'skipped':0,'unknown':0}
+for _,v in states.items():
+    s=v.get('status','unknown')
+    if s in stats:
+        stats[s]+=1
+    else:
+        stats['unknown']+=1
+print(json.dumps(stats, ensure_ascii=False))
+PY
+}
+
+action_state_details() {
+  local file="$1"
+  python3 - "$file" <<'PY'
+import json,sys
+obj=json.load(open(sys.argv[1],'r',encoding='utf-8'))
+states=obj.get('actionStates',{}) or {}
+rows=[]
+for aid,v in states.items():
+    rows.append({
+      'actionId': aid,
+      'status': v.get('status','unknown'),
+      'attempts': v.get('attempts',0),
+      'lastError': v.get('lastError','')
+    })
+rows=sorted(rows, key=lambda x: x['actionId'])
+print(json.dumps(rows, ensure_ascii=False))
+PY
+}
+
 emit_resume_summary() {
   local task_id="$1" stage="$2"
   local file; file="$(state_file "$task_id")"
@@ -256,20 +296,21 @@ emit_resume_summary() {
     return 0
   fi
 
-  local pending done cursor
+  local pending done cursor stats
   pending="$(actions_to_readable "$file" pendingActions)"
   done="$(actions_to_readable "$file" resumeCompletedActions)"
   cursor="$(state_get "$task_id" resumeCursor)"
   [ -n "$cursor" ] || cursor="0"
+  stats="$(action_state_stats "$file")"
 
   local msg
   case "$stage" in
     pre)
       msg="【重启前任务清单】任务 ${task_id}\n正在处理：重启事务执行链路\n重启后预计处理：\n${pending:-（无）}" ;;
     post-plan)
-      msg="【重启后待处理任务】任务 ${task_id}\n待处理清单：\n${pending:-（无）}\n当前游标：${cursor}" ;;
+      msg="【重启后待处理任务】任务 ${task_id}\n待处理清单：\n${pending:-（无）}\n当前游标：${cursor}\n动作统计：${stats}" ;;
     post-result)
-      msg="【重启后任务执行结果】任务 ${task_id}\n已完成：\n${done:-（无）}\n剩余待处理：\n${pending:-（无）}" ;;
+      msg="【重启后任务执行结果】任务 ${task_id}\n已完成：\n${done:-（无）}\n剩余待处理：\n${pending:-（无）}\n动作统计：${stats}" ;;
     *) return 0 ;;
   esac
 
@@ -284,7 +325,8 @@ emit_resume_summary() {
 parse_next_actions_json() {
   local next_action="$1"
   python3 - "$next_action" <<'PY'
-import json, re, sys
+import json, sys
+
 s = sys.argv[1].strip()
 actions = []
 
@@ -292,25 +334,44 @@ if not s:
     print('[]')
     raise SystemExit(0)
 
-if s.startswith('json:'):
-    raw = s[5:].strip()
-    obj = json.loads(raw)
-    if isinstance(obj, dict):
-      obj=[obj]
-    if not isinstance(obj, list):
-      raise ValueError('json: must be list/dict')
-    actions = obj
-elif s.startswith('notify:'):
-    actions = [{"type":"notify","text":s[7:].strip() or "(empty notify)"}]
-elif s.startswith('cmd:'):
-    actions = [{"type":"command","command":s[4:].strip()}]
-elif s.startswith('script:'):
-    actions = [{"type":"script","path":s[7:].strip()}]
-else:
-    # 默认把 nextAction 当作用户可见续跑说明
-    actions = [{"type":"notify","text":f"【任务续跑】{s}"}]
+def add_notify(text):
+    actions.append({"type":"notify","text":text})
 
-for i,a in enumerate(actions):
+def add_query_time(tz="Asia/Shanghai"):
+    actions.append({"type":"query_time","timezone":tz,"format":"human"})
+
+# 兼容原有前缀 + 支持分号串联表达式
+parts = [p.strip() for p in s.split(';') if p.strip()]
+if not parts:
+    parts = [s]
+
+for part in parts:
+    if part.startswith('json:'):
+        raw = part[5:].strip()
+        obj = json.loads(raw)
+        if isinstance(obj, dict):
+            obj = [obj]
+        if not isinstance(obj, list):
+            raise ValueError('json: must be list/dict')
+        actions.extend(obj)
+    elif part == 'notify-time':
+        add_query_time('Asia/Shanghai')
+        add_notify('当前时间：${current_time_human}')
+    elif part.startswith('notify-time:'):
+        tz = part.split(':', 1)[1].strip() or 'Asia/Shanghai'
+        add_query_time(tz)
+        add_notify('当前时间：${current_time_human}')
+    elif part.startswith('notify:'):
+        add_notify(part[7:].strip() or '(empty notify)')
+    elif part.startswith('cmd:'):
+        actions.append({"type":"command","command":part[4:].strip()})
+    elif part.startswith('script:'):
+        actions.append({"type":"script","path":part[7:].strip()})
+    else:
+        # 默认当作用户可见续跑说明
+        add_notify(f"【任务续跑】{part}")
+
+for i, a in enumerate(actions):
     if not isinstance(a, dict):
         raise ValueError('action must be object')
     a.setdefault('actionId', f'a{i+1}')
@@ -320,16 +381,187 @@ print(json.dumps(actions, ensure_ascii=False))
 PY
 }
 
-queue_resume_actions() {
+compile_next_plan() {
   local task_id="$1" next_action="$2"
   local actions_json
+  actions_json="$(parse_next_actions_json "$next_action")" || return 1
+  python3 - "$task_id" "$actions_json" <<'PY'
+import json,sys
+
+task_id=sys.argv[1]
+actions=json.loads(sys.argv[2])
+plan={"taskPlanVersion":"v1","taskId":task_id,"actions":actions}
+print(json.dumps(plan, ensure_ascii=False, indent=2))
+PY
+}
+
+plan_only() {
+  local task_id="$1" next_action="$2"
+  compile_next_plan "$task_id" "$next_action"
+}
+
+validate_tasks_file() {
+  local tasks_file="$1"
+  [ -f "$tasks_file" ] || die "任务计划文件不存在: $tasks_file"
+  python3 - "$tasks_file" <<'PY'
+import json,sys
+p=sys.argv[1]
+obj=json.load(open(p,'r',encoding='utf-8'))
+errs=[]
+if obj.get('taskPlanVersion')!='v1':
+    errs.append('taskPlanVersion 必须为 v1')
+if not obj.get('taskId'):
+    errs.append('taskId 不能为空')
+actions=obj.get('actions')
+if not isinstance(actions,list) or not actions:
+    errs.append('actions 必须为非空数组')
+allowed={'notify','query_time','command','script','tool_call'}
+if isinstance(actions,list):
+    for i,a in enumerate(actions,1):
+        if not isinstance(a,dict):
+            errs.append(f'actions[{i}] 必须为对象'); continue
+        if not a.get('actionId'):
+            errs.append(f'actions[{i}] 缺少 actionId')
+        t=a.get('type')
+        if t not in allowed:
+            errs.append(f'actions[{i}] 非法 type: {t}')
+
+if errs:
+    print('VALIDATE: FAIL')
+    for e in errs:
+        print('-',e)
+    raise SystemExit(1)
+
+print('VALIDATE: OK')
+print(json.dumps({'taskId':obj['taskId'],'actions':len(actions)}, ensure_ascii=False))
+PY
+}
+
+actions_json_from_tasks_file() {
+  local tasks_file="$1"
+  python3 - "$tasks_file" <<'PY'
+import json,sys
+obj=json.load(open(sys.argv[1],'r',encoding='utf-8'))
+print(json.dumps(obj.get('actions',[]), ensure_ascii=False))
+PY
+}
+
+normalize_actions_for_state() {
+  local actions_json="$1"
+  python3 - "$actions_json" <<'PY'
+import json,sys
+arr=json.loads(sys.argv[1])
+for i,a in enumerate(arr,1):
+    if not isinstance(a,dict):
+        a={"type":"notify","text":str(a)}
+        arr[i-1]=a
+    a.setdefault('actionId', f'a{i}')
+    a.setdefault('type', 'notify')
+    a.setdefault('deps', [])
+    a.setdefault('retryPolicy', {"maxRetries":0,"backoffSec":5,"strategy":"linear"})
+    a.setdefault('timeoutSec', 120)
+    a.setdefault('onFailure', 'stop')
+    a.setdefault('idempotencyKey', f"{a.get('type','notify')}:{a.get('actionId',f'a{i}')}")
+print(json.dumps(arr, ensure_ascii=False))
+PY
+}
+
+action_state_init_json() {
+  local actions_json="$1"
+  python3 - "$actions_json" <<'PY'
+import json,sys
+arr=json.loads(sys.argv[1])
+states={}
+for a in arr:
+    aid=str(a.get('actionId',''))
+    if not aid:
+        continue
+    states[aid]={"status":"pending","attempts":0,"lastError":"","startedAt":"","finishedAt":""}
+print(json.dumps(states, ensure_ascii=False))
+PY
+}
+
+idempotency_seen() {
+  local task_id="$1" idem_key="$2"
+  [ -n "$idem_key" ] || return 1
+  local v
+  v="$(state_get "$task_id" "idempotencyLedger.${idem_key}" || true)"
+  [ "$v" = "true" ]
+}
+
+idempotency_mark_done() {
+  local task_id="$1" idem_key="$2"
+  [ -n "$idem_key" ] || return 0
+  local file; file="$(state_file "$task_id")"
+  python3 - "$file" "$idem_key" <<'PY'
+import json,sys
+from datetime import datetime, timezone
+f,key=sys.argv[1:]
+obj=json.load(open(f,'r',encoding='utf-8'))
+ledger=obj.setdefault('idempotencyLedger',{})
+ledger[key]=True
+obj['updatedAt']=datetime.now(timezone.utc).astimezone().isoformat(timespec='seconds')
+json.dump(obj,open(f,'w',encoding='utf-8'),ensure_ascii=False,indent=2)
+print('ok')
+PY
+  state_update "$task_id" "resume-running" "idempotency-mark:${idem_key}" '{}'
+}
+
+action_state_mark() {
+  local task_id="$1" action_id="$2" status="$3" err="${4:-}" attempts="${5:-}"
+  local file; file="$(state_file "$task_id")"
+  python3 - "$file" "$action_id" "$status" "$err" "$attempts" <<'PY'
+import json,sys
+from datetime import datetime, timezone
+f,aid,status,err,attempts = sys.argv[1:]
+obj=json.load(open(f,'r',encoding='utf-8'))
+st=obj.setdefault('actionStates',{}).setdefault(aid,{"status":"pending","attempts":0,"lastError":"","startedAt":"","finishedAt":""})
+now=datetime.now(timezone.utc).astimezone().isoformat(timespec='seconds')
+st['status']=status
+if attempts:
+    try: st['attempts']=int(attempts)
+    except: pass
+if err is not None:
+    st['lastError']=err
+if status=='running':
+    st['startedAt']=now
+if status in ('success','failed','skipped'):
+    st['finishedAt']=now
+obj['updatedAt']=now
+json.dump(obj,open(f,'w',encoding='utf-8'),ensure_ascii=False,indent=2)
+print('ok')
+PY
+}
+
+action_deps_met() {
+  local task_id="$1" action_json="$2"
+  python3 - "$(state_file "$task_id")" "$action_json" <<'PY'
+import json,sys
+state=json.load(open(sys.argv[1],'r',encoding='utf-8'))
+a=json.loads(sys.argv[2])
+deps=a.get('deps') or a.get('params',{}).get('deps') or []
+states=state.get('actionStates',{})
+for d in deps:
+    if states.get(str(d),{}).get('status')!='success':
+        print('false')
+        raise SystemExit(0)
+print('true')
+PY
+}
+
+queue_resume_actions() {
+  local task_id="$1" next_action="$2"
+  local actions_json action_states_json
   if ! actions_json="$(parse_next_actions_json "$next_action" 2>/tmp/restart-parse.err)"; then
     local err; err="$(cat /tmp/restart-parse.err 2>/dev/null | tr '\n' ' ' | sed 's/"/\\"/g')"
     state_update "$task_id" "resume-failed" "parse-next-action-failed" "{\"resumeStatus\":\"failed\",\"resumeError\":\"$err\",\"lastError\":\"parse nextAction failed\"}"
     return 1
   fi
 
-  state_update "$task_id" "resume-queued" "resume-actions-queued" "{\"pendingActions\":$actions_json,\"resumeCompletedActions\":[],\"resumeCursor\":0,\"resumeStatus\":\"idle\",\"resumeError\":\"\",\"resumeRetryCount\":0}"
+  actions_json="$(normalize_actions_for_state "$actions_json")"
+  action_states_json="$(action_state_init_json "$actions_json")"
+
+  state_update "$task_id" "resume-queued" "resume-actions-queued" "{\"taskPlanVersion\":\"v1\",\"pendingActions\":$actions_json,\"resumeCompletedActions\":[],\"resumeCursor\":0,\"resumeStatus\":\"idle\",\"resumeError\":\"\",\"resumeRetryCount\":0,\"actionStates\":$action_states_json}"
   return 0
 }
 
@@ -372,7 +604,7 @@ is_allowed_script() {
 execute_action() {
   local task_id="$1" action_json="$2"
 
-  local action_type action_id action_text action_cmd action_path
+  local action_type action_id action_text action_cmd action_path action_tz
   action_type="$(python3 - "$action_json" <<'PY'
 import json,sys
 obj=json.loads(sys.argv[1]); print(obj.get('type','notify'))
@@ -388,12 +620,17 @@ PY
     notify)
       action_text="$(python3 - "$action_json" <<'PY'
 import json,sys
-obj=json.loads(sys.argv[1]); print(obj.get('text',''))
+obj=json.loads(sys.argv[1]); print(obj.get('text', obj.get('params',{}).get('text','')))
 PY
 )"
       if ! is_notify_required; then
         log "续跑 notify 动作缺少通知配置"
         return 1
+      fi
+      if [[ "$action_text" == *"\${current_time_human}"* ]]; then
+        local current
+        current="$(state_get "$task_id" currentTimeHuman || true)"
+        action_text="${action_text//\$\{current_time_human\}/$current}"
       fi
       # 续跑动作的通知使用 post 通道，不写入 notifyPostSent，避免污染主流程判据
       local out cmd
@@ -402,10 +639,23 @@ PY
       out="$("${cmd[@]}" 2>&1)" || { log "续跑 notify 失败(actionId=$action_id): $out"; return 1; }
       log "续跑 notify 成功(actionId=$action_id)"
       ;;
+    query_time)
+      action_tz="$(python3 - "$action_json" <<'PY'
+import json,sys
+obj=json.loads(sys.argv[1])
+print(obj.get('timezone') or obj.get('params',{}).get('timezone') or 'Asia/Shanghai')
+PY
+)"
+      local iso human
+      iso="$(TZ="$action_tz" date -Iseconds)"
+      human="$(TZ="$action_tz" date '+%Y-%m-%d %H:%M:%S (%Z)')"
+      state_update "$task_id" "resume-running" "resume-action-time:${action_id}" "{\"currentTimeIso\":\"$iso\",\"currentTimeHuman\":\"$human\",\"currentTimeTz\":\"$action_tz\"}"
+      log "续跑 query_time 成功(actionId=$action_id): $human"
+      ;;
     command)
       action_cmd="$(python3 - "$action_json" <<'PY'
 import json,sys
-obj=json.loads(sys.argv[1]); print(obj.get('command',''))
+obj=json.loads(sys.argv[1]); print(obj.get('command', obj.get('params',{}).get('command','')))
 PY
 )"
       if ! is_allowed_command "$action_cmd"; then
@@ -421,7 +671,7 @@ PY
     script)
       action_path="$(python3 - "$action_json" <<'PY'
 import json,sys
-obj=json.loads(sys.argv[1]); print(obj.get('path',''))
+obj=json.loads(sys.argv[1]); print(obj.get('path', obj.get('params',{}).get('path','')))
 PY
 )"
       if ! is_allowed_script "$action_path"; then
@@ -450,45 +700,71 @@ run_resume_actions() {
   set_resume_status "$task_id" running ""
   state_update "$task_id" "resume-running" "resume-actions-running" '{}'
 
-  local actions_count cursor
-  actions_count="$(python3 - "$file" <<'PY'
+  while true; do
+    file="$(state_file "$task_id")"
+    local actions_count
+    actions_count="$(python3 - "$file" <<'PY'
 import json,sys
 obj=json.load(open(sys.argv[1],'r',encoding='utf-8'))
 print(len(obj.get('pendingActions',[])))
 PY
 )"
-  cursor="$(state_get "$task_id" resumeCursor)"
-  [ -n "$cursor" ] || cursor="0"
 
-  if [ "$actions_count" -eq 0 ]; then
-    set_resume_status "$task_id" success ""
-    state_update "$task_id" "resume-done" "resume-actions-empty" '{}'
-    return 0
-  fi
+    if [ "$actions_count" -eq 0 ]; then
+      set_resume_status "$task_id" success ""
+      state_update "$task_id" "resume-done" "resume-actions-complete" '{}'
+      return 0
+    fi
 
-  local idx action_json action_id
-  idx="$cursor"
-  while [ "$idx" -lt "$actions_count" ]; do
-    action_json="$(python3 - "$file" "$idx" <<'PY'
+    local action_json action_id on_failure idem_key max_retries backoff deps_ok
+    action_json="$(python3 - "$file" <<'PY'
 import json,sys
 obj=json.load(open(sys.argv[1],'r',encoding='utf-8'))
-idx=int(sys.argv[2])
-print(json.dumps(obj.get('pendingActions',[])[idx], ensure_ascii=False))
+arr=obj.get('pendingActions',[])
+print(json.dumps(arr[0], ensure_ascii=False) if arr else '')
 PY
 )"
+    [ -n "$action_json" ] || {
+      set_resume_status "$task_id" success ""
+      state_update "$task_id" "resume-done" "resume-actions-empty" '{}'
+      return 0
+    }
+
     action_id="$(python3 - "$action_json" <<'PY'
 import json,sys
-print(json.loads(sys.argv[1]).get('actionId',''))
+a=json.loads(sys.argv[1]); print(a.get('actionId',''))
+PY
+)"
+    on_failure="$(python3 - "$action_json" <<'PY'
+import json,sys
+a=json.loads(sys.argv[1]); print(a.get('onFailure','stop'))
+PY
+)"
+    idem_key="$(python3 - "$action_json" <<'PY'
+import json,sys
+a=json.loads(sys.argv[1]); print(a.get('idempotencyKey',''))
+PY
+)"
+    max_retries="$(python3 - "$action_json" <<'PY'
+import json,sys
+a=json.loads(sys.argv[1]); rp=a.get('retryPolicy',{}) or {}; print(rp.get('maxRetries',0))
+PY
+)"
+    backoff="$(python3 - "$action_json" <<'PY'
+import json,sys
+a=json.loads(sys.argv[1]); rp=a.get('retryPolicy',{}) or {}; print(rp.get('backoffSec',5))
 PY
 )"
 
-    state_update "$task_id" "resume-running" "resume-action-start:${action_id}" '{}'
-    if execute_action "$task_id" "$action_json"; then
-      idx=$((idx+1))
-      local file_now
-      file_now="$(state_file "$task_id")"
-      local completed_json pending_json
-      completed_json="$(python3 - "$file_now" "$action_id" <<'PY'
+    deps_ok="$(action_deps_met "$task_id" "$action_json")"
+    if [ "$deps_ok" != "true" ]; then
+      action_state_mark "$task_id" "$action_id" "failed" "deps not satisfied" "0" >/dev/null
+      if [ "$on_failure" = "continue" ] || [ "$on_failure" = "escalate" ]; then
+        if [ "$on_failure" = "escalate" ]; then
+          state_update "$task_id" "resume-running" "resume-action-escalate:${action_id}" '{"escalationRequired":true,"escalationReason":"action_deps_not_satisfied"}'
+        fi
+        local completed_json pending_json completed_count
+        completed_json="$(python3 - "$file" "$action_id" <<'PY'
 import json,sys
 f,aid=sys.argv[1:]
 obj=json.load(open(f,'r',encoding='utf-8'))
@@ -496,35 +772,154 @@ pending=obj.get('pendingActions',[])
 done=obj.get('resumeCompletedActions',[])
 for a in pending:
     if str(a.get('actionId',''))==aid:
-        done.append(a)
-        break
+        done.append(a); break
 print(json.dumps(done, ensure_ascii=False))
 PY
 )"
-      pending_json="$(python3 - "$file_now" "$action_id" <<'PY'
+        pending_json="$(python3 - "$file" "$action_id" <<'PY'
+import json,sys
+f,aid=sys.argv[1:]
+obj=json.load(open(f,'r',encoding='utf-8'))
+pending=[a for a in obj.get('pendingActions',[]) if str(a.get('actionId',''))!=aid]
+print(json.dumps(pending, ensure_ascii=False))
+PY
+)"
+        completed_count="$(python3 - "$completed_json" <<'PY'
+import json,sys
+print(len(json.loads(sys.argv[1])))
+PY
+)"
+        state_update "$task_id" "resume-running" "resume-action-skip:${action_id}" "{\"resumeCursor\":$completed_count,\"resumeCompletedActions\":$completed_json,\"pendingActions\":$pending_json}"
+        continue
+      fi
+      state_update "$task_id" "resume-failed" "resume-action-fail:${action_id}" "{\"resumeStatus\":\"failed\",\"resumeError\":\"deps not satisfied: ${action_id}\",\"lastError\":\"resume deps failed\"}"
+      return 1
+    fi
+
+    if idempotency_seen "$task_id" "$idem_key"; then
+      action_state_mark "$task_id" "$action_id" "skipped" "idempotency hit" "0" >/dev/null
+      local completed_json pending_json completed_count
+      completed_json="$(python3 - "$file" "$action_id" <<'PY'
 import json,sys
 f,aid=sys.argv[1:]
 obj=json.load(open(f,'r',encoding='utf-8'))
 pending=obj.get('pendingActions',[])
-pending=[a for a in pending if str(a.get('actionId',''))!=aid]
+done=obj.get('resumeCompletedActions',[])
+for a in pending:
+    if str(a.get('actionId',''))==aid:
+        done.append(a); break
+print(json.dumps(done, ensure_ascii=False))
+PY
+)"
+      pending_json="$(python3 - "$file" "$action_id" <<'PY'
+import json,sys
+f,aid=sys.argv[1:]
+obj=json.load(open(f,'r',encoding='utf-8'))
+pending=[a for a in obj.get('pendingActions',[]) if str(a.get('actionId',''))!=aid]
 print(json.dumps(pending, ensure_ascii=False))
 PY
 )"
-      state_update "$task_id" "resume-running" "resume-action-ok:${action_id}" "{\"resumeCursor\":$idx,\"resumeCompletedActions\":$completed_json,\"pendingActions\":$pending_json}"
-    else
-      local retry
-      retry="$(state_get "$task_id" resumeRetryCount)"
-      [ -n "$retry" ] || retry="0"
-      retry=$((retry+1))
-      state_update "$task_id" "resume-failed" "resume-action-fail:${action_id}" "{\"resumeStatus\":\"failed\",\"resumeError\":\"action failed: ${action_id}\",\"resumeRetryCount\":$retry,\"resumeCursor\":$idx,\"lastError\":\"resume action failed\"}"
-      return 1
+      completed_count="$(python3 - "$completed_json" <<'PY'
+import json,sys
+print(len(json.loads(sys.argv[1])))
+PY
+)"
+      state_update "$task_id" "resume-running" "resume-action-skip-idempotent:${action_id}" "{\"resumeCursor\":$completed_count,\"resumeCompletedActions\":$completed_json,\"pendingActions\":$pending_json}"
+      continue
     fi
-  done
 
-  set_resume_status "$task_id" success ""
-  state_update "$task_id" "resume-done" "resume-actions-complete" "{\"resumeCursor\":$actions_count}"
-  return 0
+    local attempt=1 success="false" last_err=""
+    while [ "$attempt" -le $((max_retries + 1)) ]; do
+      action_state_mark "$task_id" "$action_id" "running" "" "$attempt" >/dev/null
+      state_update "$task_id" "resume-running" "resume-action-start:${action_id}:try-${attempt}" '{}'
+      if execute_action "$task_id" "$action_json"; then
+        success="true"
+        action_state_mark "$task_id" "$action_id" "success" "" "$attempt" >/dev/null
+        idempotency_mark_done "$task_id" "$idem_key"
+        break
+      fi
+      last_err="action failed: ${action_id}, try=${attempt}"
+      if [ "$attempt" -le "$max_retries" ]; then
+        sleep $((backoff * attempt))
+      fi
+      attempt=$((attempt+1))
+    done
+
+    if [ "$success" = "true" ]; then
+      local completed_json pending_json completed_count
+      completed_json="$(python3 - "$file" "$action_id" <<'PY'
+import json,sys
+f,aid=sys.argv[1:]
+obj=json.load(open(f,'r',encoding='utf-8'))
+pending=obj.get('pendingActions',[])
+done=obj.get('resumeCompletedActions',[])
+for a in pending:
+    if str(a.get('actionId',''))==aid:
+        done.append(a); break
+print(json.dumps(done, ensure_ascii=False))
+PY
+)"
+      pending_json="$(python3 - "$file" "$action_id" <<'PY'
+import json,sys
+f,aid=sys.argv[1:]
+obj=json.load(open(f,'r',encoding='utf-8'))
+pending=[a for a in obj.get('pendingActions',[]) if str(a.get('actionId',''))!=aid]
+print(json.dumps(pending, ensure_ascii=False))
+PY
+)"
+      completed_count="$(python3 - "$completed_json" <<'PY'
+import json,sys
+print(len(json.loads(sys.argv[1])))
+PY
+)"
+      state_update "$task_id" "resume-running" "resume-action-ok:${action_id}" "{\"resumeCursor\":$completed_count,\"resumeCompletedActions\":$completed_json,\"pendingActions\":$pending_json}"
+      continue
+    fi
+
+    action_state_mark "$task_id" "$action_id" "failed" "$last_err" "$max_retries" >/dev/null
+    if [ "$on_failure" = "continue" ] || [ "$on_failure" = "escalate" ]; then
+      if [ "$on_failure" = "escalate" ]; then
+        state_update "$task_id" "resume-running" "resume-action-escalate:${action_id}" '{"escalationRequired":true,"escalationReason":"action_failed"}'
+      fi
+      local completed_json pending_json completed_count
+      completed_json="$(python3 - "$file" "$action_id" <<'PY'
+import json,sys
+f,aid=sys.argv[1:]
+obj=json.load(open(f,'r',encoding='utf-8'))
+pending=obj.get('pendingActions',[])
+done=obj.get('resumeCompletedActions',[])
+for a in pending:
+    if str(a.get('actionId',''))==aid:
+        done.append(a); break
+print(json.dumps(done, ensure_ascii=False))
+PY
+)"
+      pending_json="$(python3 - "$file" "$action_id" <<'PY'
+import json,sys
+f,aid=sys.argv[1:]
+obj=json.load(open(f,'r',encoding='utf-8'))
+pending=[a for a in obj.get('pendingActions',[]) if str(a.get('actionId',''))!=aid]
+print(json.dumps(pending, ensure_ascii=False))
+PY
+)"
+      completed_count="$(python3 - "$completed_json" <<'PY'
+import json,sys
+print(len(json.loads(sys.argv[1])))
+PY
+)"
+      state_update "$task_id" "resume-running" "resume-action-fail-continue:${action_id}" "{\"resumeCursor\":$completed_count,\"resumeCompletedActions\":$completed_json,\"pendingActions\":$pending_json}"
+      continue
+    fi
+
+    local retry
+    retry="$(state_get "$task_id" resumeRetryCount)"
+    [ -n "$retry" ] || retry="0"
+    retry=$((retry+1))
+    state_update "$task_id" "resume-failed" "resume-action-fail:${action_id}" "{\"resumeStatus\":\"failed\",\"resumeError\":\"$last_err\",\"resumeRetryCount\":$retry,\"lastError\":\"resume action failed\"}"
+    return 1
+  done
 }
+
 
 mark_done_if_complete() {
   local task_id="$1"
@@ -640,30 +1035,32 @@ reconcile_one() {
     done)
       log "reconcile: $task_id 已完成，跳过"; return 0 ;;
     resumed|post-notified|notify-failed|health-ok|resume-failed|resume-running|resume-queued|resume-done)
+      if [ "$retry" -ge "$RECONCILE_MAX_RETRIES" ]; then
+        state_update "$task_id" "$phase" "reconcile-escalated" '{"escalationRequired":true,"escalationReason":"retry_exceeded","lastError":"reconcile retry exceeded"}'
+        log "reconcile: $task_id 超过重试上限，升级人工处理"
+        if is_notify_required; then
+          local msg="【重启补偿告警】任务 ${task_id} 已超过补偿重试上限(${RECONCILE_MAX_RETRIES})，请人工介入。"
+          local cmd=(openclaw message send --json --channel "$NOTIFY_CHANNEL" --target "$NOTIFY_TARGET" --message "$msg")
+          [ -n "$NOTIFY_ACCOUNT" ] && cmd+=(--account "$NOTIFY_ACCOUNT")
+          "${cmd[@]}" >/dev/null 2>&1 || true
+        fi
+        return 1
+      fi
+
+      if [ "$retry" -gt 0 ]; then
+        local backoff=$((RECONCILE_BACKOFF_SEC * retry))
+        log "reconcile: $task_id 退避 ${backoff}s 后重试"
+        sleep "$backoff"
+      fi
+
+      state_update "$task_id" "$phase" "reconcile-retry" "{\"resumeRetryCount\":$((retry+1))}"
+
       if [ "$restart_completed" = "true" ]; then
-        if [ "$retry" -ge "$RECONCILE_MAX_RETRIES" ]; then
-          state_update "$task_id" "$phase" "reconcile-escalated" "{"escalationRequired":true,"escalationReason":"retry_exceeded","lastError":"reconcile retry exceeded"}"
-          log "reconcile: $task_id 超过重试上限，升级人工处理"
-          if is_notify_required; then
-            local msg="【重启补偿告警】任务 ${task_id} 已超过补偿重试上限(${RECONCILE_MAX_RETRIES})，请人工介入。"
-            local cmd=(openclaw message send --json --channel "$NOTIFY_CHANNEL" --target "$NOTIFY_TARGET" --message "$msg")
-            [ -n "$NOTIFY_ACCOUNT" ] && cmd+=(--account "$NOTIFY_ACCOUNT")
-            "${cmd[@]}" >/dev/null 2>&1 || true
-          fi
-          return 1
-        fi
-
-        if [ "$retry" -gt 0 ]; then
-          local backoff=$((RECONCILE_BACKOFF_SEC * retry))
-          log "reconcile: $task_id 退避 ${backoff}s 后重试"
-          sleep "$backoff"
-        fi
-
-        state_update "$task_id" "$phase" "reconcile-retry" "{"resumeRetryCount":$((retry+1))}"
-        log "reconcile: 修复后置流程 $task_id (phase=$phase)"
+        log "reconcile: 修复后置流程 $task_id (phase=$phase, with restart)"
         finalize_after_restart "$task_id" || true
       else
-        log "reconcile: $task_id restartCompleted!=true，跳过"
+        log "reconcile: 修复续跑流程 $task_id (phase=$phase, no restart)"
+        run_resume_actions "$task_id" || true
       fi
       ;;
     *)
@@ -719,10 +1116,12 @@ OpenClaw restart-safe workflow
 
 Subcommands:
   run         预检 + 落盘 + （默认 detached）重启后续流程
+  plan        仅编译 --next 到 TaskPlan(v1)
+  validate    校验任务计划 JSON 文件
   continue    detached runner 执行重启 + finalize
   resume-run  仅执行 pendingActions（不重启）
   reconcile   对未闭环任务执行补偿（可指定 --task-id）
-  report      输出任务摘要（简版）
+  report      输出任务摘要（支持 --verbose 查看动作明细）
   diagnose    输出任务诊断建议
   resume      仅触发恢复事件（手工补偿）
   status      查看任务状态文件
@@ -730,13 +1129,15 @@ Subcommands:
 run options:
   --task-id <id>        任务ID（默认 task-YYYYmmdd-HHMMSS）
   --title <text>        任务标题
-  --next <text>         重启后下一步（支持 notify:/cmd:/script:/json:）
+  --next <text>         重启后下一步（支持 notify:/notify-time[:TZ]/cmd:/script:/json:，可用 ; 串联）
   --criteria <text>     验收标准
   --no-restart          只做预检与落盘，不执行重启
   --inline              不使用 detached runner，内联执行（调试用）
   --notify-channel <c>  可见通知渠道（如 feishu）
   --notify-target <t>   可见通知目标（user:ou_xxx / chat:oc_xxx）
   --notify-account <a>  可见通知账号ID（可选）
+  --tasks-file <file>   任务计划文件（validate 必填，run 可选先校验）
+  --verbose             report 输出动作级明细
 
 Env:
   RECONCILE_MAX_RETRIES  补偿最大重试次数（默认3）
@@ -750,7 +1151,7 @@ EOF
 }
 
 run_flow() {
-  local task_id="$1" title="$2" next_action="$3" criteria="$4" do_restart="$5" inline_mode="$6"
+  local task_id="$1" title="$2" next_action="$3" criteria="$4" do_restart="$5" inline_mode="$6" tasks_file="${7:-}"
 
   state_init "$task_id" "$title" "$next_action" "$criteria"
   state_bump_attempt "$task_id"
@@ -768,8 +1169,16 @@ run_flow() {
   state_update "$task_id" "checkpointed" "checkpoint-written" '{"checkpointed":true,"lastError":""}'
 
   log "[3/4] 解析并入队续跑动作"
-  if ! queue_resume_actions "$task_id" "$next_action"; then
-    return 1
+  if [ -n "$tasks_file" ]; then
+    local file_actions action_states_json
+    file_actions="$(actions_json_from_tasks_file "$tasks_file")"
+    file_actions="$(normalize_actions_for_state "$file_actions")"
+    action_states_json="$(action_state_init_json "$file_actions")"
+    state_update "$task_id" "resume-queued" "resume-actions-queued:tasks-file" "{\"taskPlanVersion\":\"v1\",\"pendingActions\":$file_actions,\"resumeCompletedActions\":[],\"resumeCursor\":0,\"resumeStatus\":\"idle\",\"resumeError\":\"\",\"resumeRetryCount\":0,\"actionStates\":$action_states_json}"
+  else
+    if ! queue_resume_actions "$task_id" "$next_action"; then
+      return 1
+    fi
   fi
 
   if [ "$do_restart" = "false" ]; then
@@ -812,9 +1221,15 @@ resume_only() {
 report_only() {
   local task_id="$1"; local file; file="$(state_file "$task_id")"
   [ -f "$file" ] || die "状态文件不存在: $file"
-  python3 - "$file" <<'PY'
+  python3 - "$file" "$REPORT_VERBOSE" <<'PY'
 import json,sys
 obj=json.load(open(sys.argv[1],'r',encoding='utf-8'))
+verbose=(sys.argv[2].lower()=='true')
+actions=obj.get('actionStates',{}) or {}
+stats={'pending':0,'running':0,'success':0,'failed':0,'skipped':0,'unknown':0}
+for _,v in actions.items():
+    s=v.get('status','unknown')
+    stats[s if s in stats else 'unknown']+=1
 summary={
  "taskId":obj.get("taskId"),
  "phase":obj.get("phase"),
@@ -828,8 +1243,19 @@ summary={
  "notifyPreSent":obj.get("notifyPreSent"),
  "notifyPostSent":obj.get("notifyPostSent"),
  "escalationRequired":obj.get("escalationRequired",False),
- "escalationReason":obj.get("escalationReason","")
+ "escalationReason":obj.get("escalationReason",""),
+ "actionStats":stats
 }
+if verbose:
+    details=[]
+    for aid,v in sorted(actions.items()):
+        details.append({
+          "actionId":aid,
+          "status":v.get('status','unknown'),
+          "attempts":v.get('attempts',0),
+          "lastError":v.get('lastError','')
+        })
+    summary["actionDetails"]=details
 print(json.dumps(summary,ensure_ascii=False,indent=2))
 PY
 }
@@ -842,20 +1268,51 @@ import json,sys
 obj=json.load(open(sys.argv[1],'r',encoding='utf-8'))
 phase=obj.get('phase','')
 issues=[]
-if not obj.get('doctorOk'): issues.append('doctor 未通过')
-if obj.get('restartIssued') and not obj.get('restartCompleted'): issues.append('重启命令未完成')
-if obj.get('restartCompleted') and not obj.get('healthOk'): issues.append('重启后健康检查未通过')
-if obj.get('healthOk') and not obj.get('resumeEventSent'): issues.append('resume 事件未发送')
-if obj.get('resumeStatus')!='success': issues.append('任务续跑未成功')
-if obj.get('notifyPreSent') is False: issues.append('重启前可见通知未送达')
-if obj.get('notifyPostSent') is False: issues.append('重启后可见通知未送达')
-if phase!='done': issues.append(f'当前phase={phase} 未完成')
+suggestions=[]
+if not obj.get('doctorOk'):
+    issues.append('doctor 未通过')
+    suggestions.append('执行 openclaw doctor --non-interactive 并修复告警后重试')
+if obj.get('restartIssued') and not obj.get('restartCompleted'):
+    issues.append('重启命令未完成')
+    suggestions.append('检查 openclaw gateway status 与 systemd 日志')
+if obj.get('restartCompleted') and not obj.get('healthOk'):
+    issues.append('重启后健康检查未通过')
+    suggestions.append('执行 openclaw logs / openclaw health 排障')
+if obj.get('healthOk') and not obj.get('resumeEventSent'):
+    issues.append('resume 事件未发送')
+    suggestions.append('执行 restart-safe.sh resume --task-id <id> 手动补发')
+if obj.get('resumeStatus')!='success':
+    issues.append('任务续跑未成功')
+if obj.get('notifyPreSent') is False:
+    issues.append('重启前可见通知未送达')
+if obj.get('notifyPostSent') is False:
+    issues.append('重启后可见通知未送达')
+if phase!='done':
+    issues.append(f'当前phase={phase} 未完成')
+
+actions=obj.get('actionStates',{}) or {}
+for aid,v in sorted(actions.items()):
+    st=v.get('status','unknown')
+    if st in ('failed','running','pending'):
+        issues.append(f'action[{aid}] 状态={st} attempts={v.get("attempts",0)} err={v.get("lastError","")}')
+
+if obj.get('escalationRequired'):
+    issues.append(f"升级告警已触发: {obj.get('escalationReason','unknown')}")
+
 if not issues:
     print('DIAGNOSE: OK (无阻塞问题)')
 else:
     print('DIAGNOSE: NEED_ACTION')
     for i,x in enumerate(issues,1):
         print(f'{i}. {x}')
+    uniq=[]
+    for s in suggestions:
+        if s not in uniq:
+            uniq.append(s)
+    if uniq:
+        print('--- 建议动作 ---')
+        for i,s in enumerate(uniq,1):
+            print(f'{i}. {s}')
 PY
 }
 
@@ -871,7 +1328,7 @@ main() {
 
   local cmd="${1:-}"; shift || true
   case "$cmd" in
-    run|continue|resume-run|reconcile|report|diagnose|resume|status) ;;
+    run|plan|validate|continue|resume-run|reconcile|report|diagnose|resume|status) ;;
     -h|--help|help|"") usage; exit 0 ;;
     *) die "未知子命令: $cmd" ;;
   esac
@@ -883,6 +1340,7 @@ main() {
   local criteria="workflow completed and reported"
   local do_restart="true"
   local inline_mode="false"
+  local tasks_file=""
 
   while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -895,6 +1353,8 @@ main() {
       --notify-channel) NOTIFY_CHANNEL="${2:-}"; shift 2 ;;
       --notify-target) NOTIFY_TARGET="${2:-}"; shift 2 ;;
       --notify-account) NOTIFY_ACCOUNT="${2:-}"; shift 2 ;;
+      --tasks-file) tasks_file="${2:-}"; shift 2 ;;
+      --verbose) REPORT_VERBOSE="true"; shift ;;
       -h|--help) usage; exit 0 ;;
       *) die "未知参数: $1" ;;
     esac
@@ -903,7 +1363,15 @@ main() {
   [ -n "$task_id" ] || die "--task-id 不能为空"
 
   case "$cmd" in
-    run) run_flow "$task_id" "$title" "$next_action" "$criteria" "$do_restart" "$inline_mode" ;;
+    run)
+      if [ -n "$tasks_file" ]; then
+        validate_tasks_file "$tasks_file"
+      fi
+      run_flow "$task_id" "$title" "$next_action" "$criteria" "$do_restart" "$inline_mode" "$tasks_file" ;;
+    plan) plan_only "$task_id" "$next_action" ;;
+    validate)
+      [ -n "$tasks_file" ] || die "validate 需要 --tasks-file <plan.json>"
+      validate_tasks_file "$tasks_file" ;;
     continue) continue_flow "$task_id" ;;
     resume-run) resume_run_only "$task_id" ;;
     reconcile)

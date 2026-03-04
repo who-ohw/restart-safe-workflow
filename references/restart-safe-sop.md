@@ -30,9 +30,20 @@
 
 ## `nextAction` 格式
 - `notify:<text>`
+- `notify-time`
+- `notify-time:<TZ>`
 - `cmd:<command>`
 - `script:<path>`
 - `json:[{...}]`
+- 支持 `;` 串联（例如 `notify:重启完成;notify-time`）
+
+## TaskPlan（Phase 1）
+- 预览计划：
+  - `scripts/restart-safe.sh plan --task-id <id> --next "notify:重启完成;notify-time"`
+- 校验计划：
+  - `scripts/restart-safe.sh validate --tasks-file skills/restart-safe-workflow/examples/plan-valid.json`
+- 运行时使用任务文件：
+  - `scripts/restart-safe.sh run --task-id <id> --tasks-file skills/restart-safe-workflow/examples/plan-valid.json`
 
 ## 补偿策略（reconcile）
 - 对 `resume-failed/notify-failed/post-notified/...` 任务执行补偿
@@ -54,10 +65,22 @@
   - `scripts/restart-safe.sh status --task-id <id>`
 - 查看摘要：
   - `scripts/restart-safe.sh report --task-id <id>`
+  - `scripts/restart-safe.sh report --task-id <id> --verbose`（含 action 明细）
 - 自动诊断：
   - `scripts/restart-safe.sh diagnose --task-id <id>`
 - 手工触发补偿：
   - `scripts/restart-safe.sh reconcile --task-id <id>`
+
+## 状态字段（Phase 2 扩展）
+- `actionStates.<actionId>.status`：pending/running/success/failed/skipped
+- `actionStates.<actionId>.attempts`
+- `idempotencyLedger.<idempotencyKey>`：是否已执行
+- `resumeCompletedActions`：已从队列出列的动作（含跳过/失败继续）
+
+## 失败策略
+- `onFailure=stop`：动作失败则流程失败
+- `onFailure=continue`：动作失败后继续后续动作
+- `onFailure=escalate`：动作失败后继续，并标记 `escalationRequired=true`
 
 ## 一键验收
 - 默认（不真实重启）：

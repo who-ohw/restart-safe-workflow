@@ -1,0 +1,27 @@
+{
+  "taskPlanVersion": "v1",
+  "taskId": "demo-plan-ok",
+  "actions": [
+    {
+      "actionId": "a1",
+      "type": "notify",
+      "params": {
+        "text": "重启已完成，开始后续任务"
+      }
+    },
+    {
+      "actionId": "a2",
+      "type": "query_time",
+      "params": {
+        "timezone": "Asia/Shanghai"
+      }
+    },
+    {
+      "actionId": "a3",
+      "type": "notify",
+      "params": {
+        "text": "当前时间：${current_time_human}"
+      }
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "taskPlanVersion": "v1",
+  "taskId": "task-example-phase1",
+  "actions": [
+    {
+      "actionId": "a1",
+      "type": "query_time",
+      "timezone": "Asia/Shanghai"
+    },
+    {
+      "actionId": "a2",
+      "type": "notify",
+      "text": "当前时间：${current_time_human}"
+    }
+  ]
+}
