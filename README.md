@@ -82,6 +82,20 @@ skills/restart-safe-workflow/scripts/restart-acceptance.sh --with-restart \
   --notify-channel feishu --notify-target user:<open_id> --notify-account master
 ```
 
+## 通知策略（v1.0.2+）
+
+- 默认：`NOTIFY_MODE=compact`（仅 2 条）
+  1) `【重启通知】`
+  2) `【重启成功后通知】`（合并队列统计 + 任务清单 + 清理结果）
+- 调试：`NOTIFY_MODE=verbose`（保留过程型多条通知）
+
+示例：
+
+```bash
+NOTIFY_MODE=compact skills/restart-safe-workflow/scripts/restart-safe.sh run ...
+NOTIFY_MODE=verbose skills/restart-safe-workflow/scripts/restart-safe.sh run ...
+```
+
 ## 目录（建议发布保留）
 
 ```text

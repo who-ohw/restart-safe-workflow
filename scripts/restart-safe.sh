@@ -13,6 +13,7 @@ ACTION_ALLOWLIST_FILE="${ACTION_ALLOWLIST_FILE:-}"
 NOTIFY_CHANNEL="${NOTIFY_CHANNEL:-}"
 NOTIFY_TARGET="${NOTIFY_TARGET:-}"
 NOTIFY_ACCOUNT="${NOTIFY_ACCOUNT:-}"
+NOTIFY_MODE="${NOTIFY_MODE:-compact}"
 REPORT_VERBOSE="${REPORT_VERBOSE:-false}"
 
 mkdir -p "$STATE_DIR"
@@ -293,6 +294,9 @@ emit_resume_summary() {
   local file; file="$(state_file "$task_id")"
   [ -f "$file" ] || return 0
   if ! is_notify_required; then
+    return 0
+  fi
+  if [ "$NOTIFY_MODE" = "compact" ]; then
     return 0
   fi
 
@@ -921,6 +925,60 @@ PY
 }
 
 
+build_compact_post_message() {
+  local task_id="$1"
+  local file; file="$(state_file "$task_id")"
+  python3 - "$file" <<'PY'
+import json,sys
+from datetime import datetime
+obj=json.load(open(sys.argv[1],'r',encoding='utf-8'))
+
+states=obj.get('actionStates',{}) or {}
+rows=[]
+ok=fail=running=pending=skipped=0
+for aid,v in sorted(states.items()):
+    st=v.get('status','unknown')
+    if st=='success': ok+=1
+    elif st=='failed': fail+=1
+    elif st=='running': running+=1
+    elif st=='pending': pending+=1
+    elif st=='skipped': skipped+=1
+    err=(v.get('lastError') or '').strip()
+    attempts=v.get('attempts',0)
+    item=f"{aid}:{st}"
+    if st=='failed' and attempts:
+        item += f"(重试{attempts}次)"
+    if st=='failed' and err:
+        item += f"[{err[:24]}]"
+    rows.append(item)
+
+total=len(states)
+remaining=len(obj.get('pendingActions',[]) or [])
+
+# 时间优先用已记录值，其次当前时间
+time_human=obj.get('currentTimeHuman')
+if not time_human:
+    time_human=datetime.now().strftime('%Y-%m-%d %H:%M:%S (Asia/Shanghai)')
+
+# 任务清单展示上限
+max_items=8
+shown=rows[:max_items]
+more=max(0,len(rows)-max_items)
+list_text='；'.join(shown) if shown else '无'
+if more>0:
+    list_text += f'；其余{more}项省略'
+
+cleanup=f"清理结果：剩余待处理 {remaining} 项"
+msg=(
+    f"【重启成功后通知】Gateway 已恢复（{time_human}）。"
+    f"任务队列：总{total}｜完成{ok}｜失败{fail}｜跳过{skipped}｜执行中{running}｜待处理{pending}。"
+    f"任务清单：{list_text}。"
+    f"{cleanup}。"
+)
+print(msg)
+PY
+}
+
 mark_done_if_complete() {
   local task_id="$1"
   local ok_health ok_resume ok_pre ok_post ok_resume_actions
@@ -971,20 +1029,29 @@ finalize_after_restart() {
   fi
 
   emit_event "restart-result:${task_id}:重启恢复成功，已触发resume事件"
-  if is_notify_required; then
+  if is_notify_required && [ "$NOTIFY_MODE" != "compact" ]; then
     if ! emit_visible "$task_id" post "【重启完成】任务 ${task_id} 已恢复成功，resume 事件已触发。"; then
       state_update "$task_id" "notify-failed" "post-notify-failed" '{"lastError":"post visible notify failed"}'
       return 1
     fi
+    state_update "$task_id" "post-notified" "post-notify-finished" '{}'
   fi
-
-  state_update "$task_id" "post-notified" "post-notify-finished" '{}'
 
   emit_resume_summary "$task_id" post-plan || true
 
   log "[F3] 执行任务续跑动作"
   if ! run_resume_actions "$task_id"; then
     return 1
+  fi
+
+  if is_notify_required && [ "$NOTIFY_MODE" = "compact" ]; then
+    local compact_msg
+    compact_msg="$(build_compact_post_message "$task_id")"
+    if ! emit_visible "$task_id" post "$compact_msg"; then
+      state_update "$task_id" "notify-failed" "post-notify-failed:compact" '{"lastError":"post compact notify failed"}'
+      return 1
+    fi
+    state_update "$task_id" "post-notified" "post-notify-finished:compact" '{}'
   fi
 
   emit_resume_summary "$task_id" post-result || true
@@ -1143,6 +1210,7 @@ Env:
   RECONCILE_MAX_RETRIES  补偿最大重试次数（默认3）
   RECONCILE_BACKOFF_SEC  补偿退避秒数（默认5）
   ACTION_ALLOWLIST_FILE  命令白名单文件（每行一个前缀）
+  NOTIFY_MODE            通知模式：compact(默认2条) | verbose(多条过程通知)
 
 State phases:
   init -> prechecked -> checkpointed -> resume-queued -> restarting -> health-ok -> resumed -> post-notified -> resume-running -> resume-done -> done
