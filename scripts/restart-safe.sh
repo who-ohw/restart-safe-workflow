@@ -959,7 +959,7 @@ for a in completed + pending_actions:
 
 rows=[]
 ok=fail=running=pending=skipped=0
-for aid,v in sorted(states.items()):
+for idx,(aid,v) in enumerate(sorted(states.items()), start=1):
     st=v.get('status','unknown')
     if st=='success': ok+=1
     elif st=='failed': fail+=1
@@ -969,17 +969,16 @@ for aid,v in sorted(states.items()):
 
     m=meta.get(aid,{})
     t=m.get('type','unknown')
-    brief=m.get('brief','')
     err=(v.get('lastError') or '').strip()
     attempts=v.get('attempts',0)
 
-    item=f"{aid}({t})={st}"
-    if brief:
-        item += f":{brief}"
+    icon={'success':'✅','failed':'❌','skipped':'⏭️','running':'⏳','pending':'🕒'}.get(st,'•')
+    item=f"{idx}. `{aid}` · {t} · {icon} {st}"
     if st=='failed' and attempts:
-        item += f"(重试{attempts}次)"
-    if st=='failed' and err:
-        item += f"[{err[:24]}]"
+        item += f"（重试{attempts}次"
+        if err:
+            item += f"，{err[:24]}"
+        item += "）"
     rows.append(item)
 
 total=len(states)
@@ -1001,21 +1000,18 @@ if not time_human:
 max_items=8
 shown=rows[:max_items]
 more=max(0,len(rows)-max_items)
-list_text='；'.join(shown) if shown else '无'
+list_text='\n'.join(shown) if shown else '无'
 if more>0:
-    list_text += f'；其余{more}项省略'
-
-cleanup=(
-    f"任务清理：已清理{cleaned_total}项"
-    f"（成功{cleaned_success}/失败{cleaned_failed}/跳过{cleaned_skipped}）"
-    f"；保留{remaining}项；告警{alerts}项"
-)
+    list_text += f'\n{max_items+1}. 其余 **{more}** 项已省略'
 
 msg=(
-    f"【重启成功后通知】Gateway 已恢复（{time_human}）。"
-    f"任务队列：总{total}｜完成{ok}｜失败{fail}｜跳过{skipped}｜执行中{running}｜待处理{pending}。"
-    f"任务清单：{list_text}。"
-    f"{cleanup}。"
+    "### ✅ 重启成功后通知\n\n"
+    "**Gateway 状态**：已恢复\n"
+    f"**当前时间**：{time_human}\n"
+    f"**任务队列**：总 {total}｜完成 {ok}｜失败 {fail}｜跳过 {skipped}｜执行中 {running}｜待处理 {pending}\n"
+    f"**任务清理结果**：已清理 {cleaned_total}（成功 {cleaned_success} / 失败 {cleaned_failed} / 跳过 {cleaned_skipped}）｜保留 {remaining}｜告警 {alerts}\n\n"
+    "#### 任务清单（摘要）\n"
+    f"{list_text}"
 )
 print(msg)
 PY
