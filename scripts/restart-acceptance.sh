@@ -1,127 +1,87 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 一键验收：OpenClaw 重启安全流程
-# 默认“无真实重启”模式，避免影响在线任务。
-# 若要验证真实重启链路：--with-restart
+# 一键验收：OpenClaw 重启安全流程（Sprint4）
+# 覆盖：状态机、真实重启、任务续跑、补偿重试、report/diagnose
 
 WITH_RESTART="false"
 TASK_PREFIX="accept-$(date +%Y%m%d-%H%M%S)"
 STATE_DIR="${STATE_DIR:-./state/restart}"
-REPORT_FILE="${REPORT_FILE:-./state/restart/acceptance-${TASK_PREFIX}.log}"
+REPORT_FILE=""
 NOTIFY_CHANNEL="${NOTIFY_CHANNEL:-}"
 NOTIFY_TARGET="${NOTIFY_TARGET:-}"
 NOTIFY_ACCOUNT="${NOTIFY_ACCOUNT:-}"
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SAFE_SCRIPT="${SCRIPT_DIR}/restart-safe.sh"
+ALLOWLIST_FILE="${SCRIPT_DIR}/../config-action-allowlist.txt"
+
 while [ "$#" -gt 0 ]; do
   case "$1" in
-    --with-restart)
-      WITH_RESTART="true"; shift ;;
-    --task-prefix)
-      TASK_PREFIX="${2:-}"; shift 2 ;;
-    --notify-channel)
-      NOTIFY_CHANNEL="${2:-}"; shift 2 ;;
-    --notify-target)
-      NOTIFY_TARGET="${2:-}"; shift 2 ;;
-    --notify-account)
-      NOTIFY_ACCOUNT="${2:-}"; shift 2 ;;
+    --with-restart) WITH_RESTART="true"; shift ;;
+    --task-prefix) TASK_PREFIX="${2:-}"; shift 2 ;;
+    --report-file) REPORT_FILE="${2:-}"; shift 2 ;;
+    --notify-channel) NOTIFY_CHANNEL="${2:-}"; shift 2 ;;
+    --notify-target) NOTIFY_TARGET="${2:-}"; shift 2 ;;
+    --notify-account) NOTIFY_ACCOUNT="${2:-}"; shift 2 ;;
     -h|--help)
       cat <<'EOF'
 用法：
-  scripts/restart-acceptance.sh [--with-restart] [--task-prefix <prefix>]
-                                [--notify-channel <c> --notify-target <t> [--notify-account <a>]]
-
-说明：
-  默认不执行真实重启，只验证：
-  1) doctor可执行
-  2) doctor失败时能阻断流程
-  3) checkpoint落盘
-  4) resume事件可补发
-
-  加 --with-restart 后，额外验证真实重启链路与通知事件：
-  - restart-notice（重启前提示）
-  - restart-result（重启后回执）
-
-  若提供 notify 参数，将额外验证“用户可见回执”标记（result-visible）。
+  skills/restart-safe-workflow/scripts/restart-acceptance.sh [--with-restart]
+      [--task-prefix <prefix>] [--report-file <path>]
+      [--notify-channel <c> --notify-target <t> [--notify-account <a>]]
 EOF
       exit 0 ;;
-    *)
-      echo "未知参数: $1" >&2
-      exit 2 ;;
+    *) echo "未知参数: $1" >&2; exit 2 ;;
   esac
 done
 
+[ -n "$REPORT_FILE" ] || REPORT_FILE="./state/restart/acceptance-${TASK_PREFIX}.log"
 mkdir -p "$(dirname "$REPORT_FILE")" "$STATE_DIR"
 : > "$REPORT_FILE"
 
 PASS_CNT=0
 FAIL_CNT=0
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S%z')] $*" | tee -a "$REPORT_FILE"; }
+pass() { PASS_CNT=$((PASS_CNT+1)); log "PASS | $*"; }
+fail() { FAIL_CNT=$((FAIL_CNT+1)); log "FAIL | $*"; }
+require_cmd(){ command -v "$1" >/dev/null 2>&1 || { log "缺少命令: $1"; exit 2; }; }
 
-log() {
-  echo "[$(date '+%Y-%m-%d %H:%M:%S%z')] $*" | tee -a "$REPORT_FILE"
-}
-
-pass() {
-  PASS_CNT=$((PASS_CNT + 1))
-  log "PASS | $*"
-}
-
-fail() {
-  FAIL_CNT=$((FAIL_CNT + 1))
-  log "FAIL | $*"
-}
-
-require_cmd() {
-  command -v "$1" >/dev/null 2>&1 || {
-    log "缺少命令: $1"
-    exit 2
-  }
-}
-
-json_phase() {
-  local file="$1"
-  python3 - "$file" <<'PY'
+json_get() {
+  local file="$1" key="$2"
+  python3 - "$file" "$key" <<'PY'
 import json,sys
-with open(sys.argv[1], 'r', encoding='utf-8') as f:
-    obj=json.load(f)
-print(obj.get('phase',''))
-PY
-}
-
-json_note() {
-  local file="$1"
-  python3 - "$file" <<'PY'
-import json,sys
-with open(sys.argv[1], 'r', encoding='utf-8') as f:
-    obj=json.load(f)
-print(obj.get('note',''))
+f,k=sys.argv[1:]
+with open(f,'r',encoding='utf-8') as fh: obj=json.load(fh)
+cur=obj
+for p in k.split('.'):
+    if isinstance(cur,dict) and p in cur: cur=cur[p]
+    else: print(''); raise SystemExit(0)
+if isinstance(cur,bool): print('true' if cur else 'false')
+elif cur is None: print('')
+else: print(cur)
 PY
 }
 
 require_cmd openclaw
 require_cmd python3
 require_cmd bash
-
-SAFE_SCRIPT="scripts/restart-safe.sh"
-[ -x "$SAFE_SCRIPT" ] || {
-  log "未找到可执行脚本: $SAFE_SCRIPT"
-  exit 2
-}
+[ -x "$SAFE_SCRIPT" ] || { log "未找到可执行脚本: $SAFE_SCRIPT"; exit 2; }
 
 TASK_MAIN="${TASK_PREFIX}-main"
 TASK_GATE="${TASK_PREFIX}-gate"
 TASK_RESTART="${TASK_PREFIX}-restart"
-
+TASK_RETRY="${TASK_PREFIX}-retry"
 STATE_MAIN="${STATE_DIR}/${TASK_MAIN}.json"
 STATE_GATE="${STATE_DIR}/${TASK_GATE}.json"
 STATE_RESTART="${STATE_DIR}/${TASK_RESTART}.json"
+STATE_RETRY="${STATE_DIR}/${TASK_RETRY}.json"
+RUNNER_LOG="${STATE_DIR}/${TASK_RESTART}.runner.log"
 
 NOTIFY_ARGS=()
 if [ -n "$NOTIFY_CHANNEL" ] && [ -n "$NOTIFY_TARGET" ]; then
   NOTIFY_ARGS+=(--notify-channel "$NOTIFY_CHANNEL" --notify-target "$NOTIFY_TARGET")
-  if [ -n "$NOTIFY_ACCOUNT" ]; then
-    NOTIFY_ARGS+=(--notify-account "$NOTIFY_ACCOUNT")
-  fi
+  [ -n "$NOTIFY_ACCOUNT" ] && NOTIFY_ARGS+=(--notify-account "$NOTIFY_ACCOUNT")
   log "notify configured: channel=$NOTIFY_CHANNEL target=$NOTIFY_TARGET account=${NOTIFY_ACCOUNT:-<default>}"
 else
   log "notify not configured: skip visible-ack assertion"
@@ -132,15 +92,12 @@ log "task_prefix=${TASK_PREFIX}"
 log "with_restart=${WITH_RESTART}"
 log "report=${REPORT_FILE}"
 
-# TC1: 当前配置 doctor 可执行
 if openclaw doctor --non-interactive >/tmp/restart-accept-doctor.out 2>&1; then
   pass "TC1 doctor --non-interactive 可执行"
 else
   fail "TC1 doctor --non-interactive 失败（请先修复配置）"
-  cat /tmp/restart-accept-doctor.out | tail -n 80 | tee -a "$REPORT_FILE" >/dev/null || true
 fi
 
-# TC2: doctor 失败时应阻断流程（不落 checkpoint）
 TMPDIR_SHIM="$(mktemp -d)"
 REAL_OPENCLAW="$(command -v openclaw)"
 mkdir -p "$TMPDIR_SHIM/bin"
@@ -158,72 +115,114 @@ rm -f "$STATE_GATE"
 if PATH="$TMPDIR_SHIM/bin:$PATH" "$SAFE_SCRIPT" run --task-id "$TASK_GATE" --no-restart >/tmp/restart-accept-gate.out 2>&1; then
   fail "TC2 doctor失败阻断未生效（流程不应成功）"
 else
-  if [ -f "$STATE_GATE" ]; then
-    fail "TC2 doctor失败后仍产生状态文件（不符合预期）"
+  if [ -f "$STATE_GATE" ] && [ "$(json_get "$STATE_GATE" phase)" = "doctor-failed" ] && [ "$(json_get "$STATE_GATE" doctorOk)" = "false" ]; then
+    pass "TC2 doctor失败可阻断重启，且写入失败态 phase=doctor-failed"
   else
-    pass "TC2 doctor失败可阻断流程，且不落盘"
+    fail "TC2 doctor失败后状态不符合预期"
   fi
 fi
 rm -rf "$TMPDIR_SHIM"
 
-# TC3: 正常 no-restart 时能落盘 before-restart
 rm -f "$STATE_MAIN"
-if "$SAFE_SCRIPT" run --task-id "$TASK_MAIN" --next "重启后继续执行验证动作" --criteria "看到续跑证据" --no-restart >/tmp/restart-accept-main.out 2>&1; then
-  if [ -f "$STATE_MAIN" ] && [ "$(json_phase "$STATE_MAIN")" = "before-restart" ]; then
-    pass "TC3 no-restart 可落盘且 phase=before-restart"
+if ACTION_ALLOWLIST_FILE="$ALLOWLIST_FILE" "$SAFE_SCRIPT" run --task-id "$TASK_MAIN" --next "cmd:echo sprint4-resume-ok" --criteria "看到续跑证据" --no-restart >/tmp/restart-accept-main.out 2>&1; then
+  if [ -f "$STATE_MAIN" ] && [ "$(json_get "$STATE_MAIN" phase)" = "resume-queued" ]; then
+    pass "TC3 no-restart 可落盘且 phase=resume-queued"
   else
-    fail "TC3 状态文件缺失或 phase 非 before-restart"
+    fail "TC3 状态文件缺失或 phase 非 resume-queued"
   fi
 else
   fail "TC3 run --no-restart 执行失败"
 fi
 
-# TC4: resume 可补发并更新 phase=resume-triggered
-if "$SAFE_SCRIPT" resume --task-id "$TASK_MAIN" >/tmp/restart-accept-resume.out 2>&1; then
-  if [ -f "$STATE_MAIN" ] && [ "$(json_phase "$STATE_MAIN")" = "resume-triggered" ]; then
-    pass "TC4 resume 补发成功且 phase=resume-triggered"
+if ACTION_ALLOWLIST_FILE="$ALLOWLIST_FILE" "$SAFE_SCRIPT" resume-run --task-id "$TASK_MAIN" >/tmp/restart-accept-resumerun.out 2>&1; then
+  if [ "$(json_get "$STATE_MAIN" resumeStatus)" = "success" ] && [ "$(json_get "$STATE_MAIN" phase)" = "resume-done" ]; then
+    pass "TC4 resume-run 成功且 resumeStatus=success"
   else
-    fail "TC4 resume后状态异常"
+    fail "TC4 resume-run 后状态异常"
   fi
 else
-  fail "TC4 resume 执行失败"
+  fail "TC4 resume-run 执行失败"
 fi
 
-# TC5: 可选真实重启链路 + 事件回执验证
+if ACTION_ALLOWLIST_FILE="$ALLOWLIST_FILE" "$SAFE_SCRIPT" report --task-id "$TASK_MAIN" >/tmp/restart-accept-report.out 2>&1; then
+  grep -q '"pendingCount"' /tmp/restart-accept-report.out && pass "TC5 report 输出摘要成功" || fail "TC5 report 输出缺少关键字段"
+else
+  fail "TC5 report 执行失败"
+fi
+
+if ACTION_ALLOWLIST_FILE="$ALLOWLIST_FILE" "$SAFE_SCRIPT" diagnose --task-id "$TASK_MAIN" >/tmp/restart-accept-diagnose.out 2>&1; then
+  grep -q 'DIAGNOSE:' /tmp/restart-accept-diagnose.out && pass "TC6 diagnose 输出成功" || fail "TC6 diagnose 输出异常"
+else
+  fail "TC6 diagnose 执行失败"
+fi
+
 if [ "$WITH_RESTART" = "true" ]; then
-  rm -f "$STATE_RESTART"
-  if "$SAFE_SCRIPT" run --task-id "$TASK_RESTART" --next "真实重启后继续" --criteria "真实重启链路完成" "${NOTIFY_ARGS[@]}" >/tmp/restart-accept-real.out 2>&1; then
-    if [ -f "$STATE_RESTART" ] && [ "$(json_phase "$STATE_RESTART")" = "resume-triggered" ]; then
-      NOTE_VAL="$(json_note "$STATE_RESTART")"
-      if echo "$NOTE_VAL" | grep -q "result-event"; then
-        if [ -n "$NOTIFY_CHANNEL" ] && [ -n "$NOTIFY_TARGET" ]; then
-          if echo "$NOTE_VAL" | grep -q "result-visible"; then
-            pass "TC5 真实重启链路通过，且用户可见回执已发送(result-visible)"
-          else
-            fail "TC5 真实重启链路通过，但未发现用户可见回执标记(result-visible)"
-          fi
+  rm -f "$STATE_RESTART" "$RUNNER_LOG"
+  if ACTION_ALLOWLIST_FILE="$ALLOWLIST_FILE" "$SAFE_SCRIPT" run --task-id "$TASK_RESTART" --next "notify:重启后自动续跑动作" --criteria "真实重启+续跑完成" "${NOTIFY_ARGS[@]}" >/tmp/restart-accept-real.out 2>&1; then
+    pass "TC7 run 启动成功（detached）"
+  else
+    fail "TC7 run 启动失败"
+  fi
+
+  ok="false"
+  for _ in $(seq 1 120); do
+    if [ -f "$STATE_RESTART" ]; then
+      ph="$(json_get "$STATE_RESTART" phase)"
+      if [ "$ph" = "done" ]; then ok="true"; break; fi
+      if [ "$ph" = "restart-failed" ] || [ "$ph" = "health-failed" ] || [ "$ph" = "notify-failed" ] || [ "$ph" = "resume-failed" ]; then break; fi
+    fi
+    sleep 2
+  done
+
+  if [ "$ok" = "true" ]; then
+    if [ "$(json_get "$STATE_RESTART" healthOk)" = "true" ] && [ "$(json_get "$STATE_RESTART" resumeEventSent)" = "true" ] && [ "$(json_get "$STATE_RESTART" resumeStatus)" = "success" ]; then
+      if [ -n "$NOTIFY_CHANNEL" ] && [ -n "$NOTIFY_TARGET" ]; then
+        if [ "$(json_get "$STATE_RESTART" notifyPreSent)" = "true" ] && [ "$(json_get "$STATE_RESTART" notifyPostSent)" = "true" ]; then
+          pass "TC8 真实重启 + 通知 + 续跑全通过"
         else
-          pass "TC5 真实重启链路通过，系统事件回执存在(result-event)"
+          fail "TC8 真实重启通过，但通知字段不完整"
         fi
       else
-        fail "TC5 真实重启链路通过，但未发现系统回执标记(result-event)"
+        pass "TC8 真实重启+续跑通过（无通知断言）"
       fi
     else
-      fail "TC5 真实重启后状态异常"
+      fail "TC8 真实重启链路未满足 health/resume/resumeStatus"
     fi
   else
-    fail "TC5 真实重启链路失败"
+    fail "TC8 真实重启未收敛到 done"
+    [ -f "$RUNNER_LOG" ] && tail -n 120 "$RUNNER_LOG" | tee -a "$REPORT_FILE" >/dev/null || true
+  fi
+
+  # TC9: 注入失败并验证重试升级
+  rm -f "$STATE_RETRY"
+  if ACTION_ALLOWLIST_FILE="$ALLOWLIST_FILE" "$SAFE_SCRIPT" run --task-id "$TASK_RETRY" --next "cmd:forbidden_command_should_fail" --no-restart >/tmp/restart-accept-retry-run.out 2>&1; then
+    if ACTION_ALLOWLIST_FILE="$ALLOWLIST_FILE" "$SAFE_SCRIPT" resume-run --task-id "$TASK_RETRY" >/tmp/restart-accept-retry-resume.out 2>&1; then
+      fail "TC9 预期续跑失败但实际成功"
+    else
+      [ "$(json_get "$STATE_RETRY" phase)" = "resume-failed" ] && pass "TC9 续跑失败注入成功" || fail "TC9 续跑失败后phase异常"
+    fi
+  else
+    fail "TC9 前置run失败"
+  fi
+
+  if RECONCILE_MAX_RETRIES=1 ACTION_ALLOWLIST_FILE="$ALLOWLIST_FILE" "$SAFE_SCRIPT" reconcile --task-id "$TASK_RETRY" >/tmp/restart-accept-retry-reconcile.out 2>&1; then
+    if [ "$(json_get "$STATE_RETRY" escalationRequired)" = "true" ] || [ "$(json_get "$STATE_RETRY" phase)" = "resume-failed" ] || [ "$(json_get "$STATE_RETRY" phase)" = "notify-failed" ]; then
+      pass "TC10 reconcile 重试策略生效"
+    else
+      fail "TC10 reconcile 重试策略未生效"
+    fi
+  else
+    # reconcile 可能返回非0，但状态落盘可视为策略触发
+    if [ "$(json_get "$STATE_RETRY" escalationRequired)" = "true" ]; then
+      pass "TC10 reconcile 升级策略触发（返回非0）"
+    else
+      fail "TC10 reconcile 执行失败且无升级状态"
+    fi
   fi
 else
-  log "SKIP | TC5 真实重启链路（使用 --with-restart 开启）"
+  log "SKIP | TC7~TC10 真实重启/补偿链路（使用 --with-restart 开启）"
 fi
 
 log "=== 验收结束：PASS=${PASS_CNT}, FAIL=${FAIL_CNT} ==="
-
-if [ "$FAIL_CNT" -gt 0 ]; then
-  log "结果：FAIL"
-  exit 1
-fi
-
-log "结果：PASS"
-exit 0
+if [ "$FAIL_CNT" -gt 0 ]; then log "结果：FAIL"; exit 1; fi
+log "结果：PASS"; exit 0

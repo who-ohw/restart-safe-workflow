@@ -1,0 +1,6 @@
+# One prefix per line. Lines starting with # are comments.
+openclaw gateway status
+openclaw health
+openclaw status
+date
+echo 

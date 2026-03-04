@@ -1,59 +1,71 @@
-# OpenClaw 重启安全流程（SOP）
+# OpenClaw 重启安全流程（SOP, Sprint 4）
 
-适用场景：任务中涉及 `openclaw gateway restart` / 配置变更后重启 / node 重启。
+适用场景：任务中涉及 `openclaw gateway restart` / 配置变更后重启 / 需要重启后自动续跑。
 
 ## 目标
-- 重启前发现配置风险，避免“重启失败后人工排障”。
-- 重启后自动恢复任务，避免“任务丢失、长时间无回应”。
+- 重启前发现配置风险，避免重启失败后人工排障。
+- 重启后自动恢复任务并继续执行 pendingActions。
+- 全流程具备可见回执、可诊断、可补偿、可升级。
 
-## 一、推荐脚本
-- 路径：`scripts/restart-safe.sh`
-- 功能：预检 → 落盘 → 重启 → 健康检查 → 恢复触发
+## 标准流程
+1. `doctor` 预检：`openclaw doctor --non-interactive`
+2. checkpoint 落盘：写入 state/restart/<taskId>.json
+3. 解析 `nextAction` 并入队 `pendingActions`
+4. 发送重启前通知 + 任务清单（pre）
+5. detached runner 执行重启
+6. 重启后健康检查
+7. 触发 resume 事件 + 重启完成通知
+8. 发送重启后待处理任务清单（post-plan）
+9. 执行任务续跑动作（resume actions）
+10. 发送重启后任务执行结果（post-result）
+11. done gate 判定，满足条件后置 `phase=done`
 
-### 1) 执行完整流程
-```bash
-scripts/restart-safe.sh run \
-  --task-id task-20260303-001 \
-  --next "重启后继续执行步骤3：连接校验并输出结果" \
-  --criteria "收到连接正常并提交报告"
-```
+## done gate（严格）
+必须同时满足：
+- `healthOk=true`
+- `resumeEventSent=true`
+- `notifyPreSent=true`（若启用通知）
+- `notifyPostSent=true`（若启用通知）
+- `resumeStatus=success`
 
-### 2) 仅预检+落盘（不重启）
-```bash
-scripts/restart-safe.sh run --task-id task-20260303-001 --no-restart
-```
+## `nextAction` 格式
+- `notify:<text>`
+- `cmd:<command>`
+- `script:<path>`
+- `json:[{...}]`
 
-### 3) 手工补发恢复事件
-```bash
-scripts/restart-safe.sh resume --task-id task-20260303-001
-```
+## 补偿策略（reconcile）
+- 对 `resume-failed/notify-failed/post-notified/...` 任务执行补偿
+- 支持重试与退避：
+  - `RECONCILE_MAX_RETRIES`（默认 3）
+  - `RECONCILE_BACKOFF_SEC`（默认 5）
+- 超限升级：
+  - `escalationRequired=true`
+  - `escalationReason=retry_exceeded`
+  - 可见告警通知（若启用通知）
 
-### 4) 查看任务恢复状态
-```bash
-scripts/restart-safe.sh status --task-id task-20260303-001
-```
+## 白名单策略
+- 默认内置白名单（健康检查、状态查询、echo）
+- 可通过 `ACTION_ALLOWLIST_FILE` 覆盖
+- 白名单外命令拒绝执行并记为 `resume-failed`
 
-## 二、状态文件
-- 默认目录：`state/restart/`
-- 文件名：`<taskId>.json`
-- 关键字段：
-  - `phase`：`before-restart` / `restart-failed` / `resume-triggered`
-  - `nextAction`：重启后下一步
-  - `successCriteria`：验收标准
+## 诊断与排障
+- 查看原始状态：
+  - `scripts/restart-safe.sh status --task-id <id>`
+- 查看摘要：
+  - `scripts/restart-safe.sh report --task-id <id>`
+- 自动诊断：
+  - `scripts/restart-safe.sh diagnose --task-id <id>`
+- 手工触发补偿：
+  - `scripts/restart-safe.sh reconcile --task-id <id>`
 
-## 三、失败处理
-1. `doctor` 失败：
-   - 禁止重启，先修复配置问题。
-2. 重启后健康检查失败：
-   - 先执行 `openclaw logs` + `openclaw gateway status` 定位。
-3. 重启后未自动续跑：
-   - 手工执行 `scripts/restart-safe.sh resume --task-id <id>`。
+## 一键验收
+- 默认（不真实重启）：
+  - `scripts/restart-acceptance.sh`
+- 真实重启链路：
+  - `scripts/restart-acceptance.sh --with-restart --notify-channel feishu --notify-target user:<open_id> --notify-account master`
 
-## 四、可选参数（环境变量）
-- `STATE_DIR`：状态目录（默认 `./state/restart`）
-- `GATEWAY_RESTART_CMD`：重启命令（默认 `openclaw gateway restart`）
-- `HEALTH_TIMEOUT_SEC`：健康检查超时秒数（默认 `30`）
-
-## 五、团队执行纪律（建议）
+## 执行纪律
 - No doctor, no restart.
 - No checkpoint, no restart.
+- No done without resume success.
